@@ -844,6 +844,22 @@ tr.summary-aggregated {
   font-size: 12px;
 }
 
+.host-table .host-mac {
+  min-width: 150px;
+  width: 170px;
+}
+
+.host-table .host-mac input {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.host-mac-empty {
+  color: var(--muted);
+  font-size: 12px;
+  font-family: inherit;
+}
+
 .host-mode {
   display: inline-block;
   font-size: 11px;
@@ -907,7 +923,7 @@ tr.host-invalid-row {
 
 .host-add-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr) minmax(0, 1.2fr) auto auto;
   gap: 8px;
   align-items: center;
 }
@@ -930,4 +946,70 @@ tr.host-invalid-row {
   font-size: 13px;
   margin: 0 0 8px;
   color: #fca5a5;
+}
+
+/* ---------- dnsmasq 静态租约 ---------- */
+.host-dnsmasq {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.host-dnsmasq-title {
+  font-size: 13px;
+  margin: 0;
+}
+
+.host-dnsmasq-out {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 4px 0 8px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #a5f3fc;
+  white-space: pre;
+}
+
+.host-dnsmasq-skipped {
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+  margin-top: 8px;
+}
+
+.host-dnsmasq-skipped-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.host-dnsmasq-skipped ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.host-dnsmasq-skipped li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.host-dnsmasq-skip-name {
+  min-width: 8em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.host-dnsmasq-skip-ip {
+  color: var(--muted);
 }

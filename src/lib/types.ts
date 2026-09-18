@@ -175,4 +175,6 @@ export interface HostAssignment {
   /** 登记地址（数值，始终保存用户最后确认的地址，失效时也不静默改写） */
   address: number
   mode: HostAssignMode
+  /** 规范化后的 MAC（小写冒号格式，如 52:54:00:12:34:56）；空字符串表示未录入 */
+  mac: string
 }

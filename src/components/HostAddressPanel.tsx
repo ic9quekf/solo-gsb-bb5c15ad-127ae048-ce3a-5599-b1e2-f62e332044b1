@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react'
-import { intToIp, ipToInt } from '../lib/ip'
+import { copyText } from '../lib/clipboard'
+import { buildDnsmasqLeases, normalizeMac, validateMac } from '../lib/dnsmasq'
+import { downloadText } from '../lib/exporter'
 import {
   allocatableSegments,
   firstFreeAddress,
@@ -8,6 +10,7 @@ import {
   type AllocSegment,
   type HostInvalidReason,
 } from '../lib/hosts'
+import { intToIp, ipToInt } from '../lib/ip'
 import type { HostAssignment, PlanResult } from '../lib/types'
 
 interface Props {
@@ -53,10 +56,14 @@ function SegmentBlock({
 }) {
   const [name, setName] = useState('')
   const [addrInput, setAddrInput] = useState('')
+  const [macInput, setMacInput] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
-  const [editing, setEditing] = useState<{ id: string; value: string; error: string | null } | null>(
-    null,
-  )
+  const [editing, setEditing] = useState<{
+    id: string
+    value: string
+    mac: string
+    error: string | null
+  } | null>(null)
 
   function commit(next: HostAssignment[]) {
     setFormError(null)
@@ -74,6 +81,11 @@ function SegmentBlock({
       setFormError(err)
       return
     }
+    const macErr = validateMac(macInput, assignments)
+    if (macErr) {
+      setFormError(macErr)
+      return
+    }
     commit([
       ...assignments,
       {
@@ -82,16 +94,23 @@ function SegmentBlock({
         name: trimmedName,
         address: ipToInt(addrInput.trim()),
         mode: 'manual',
+        mac: normalizeMac(macInput) ?? '',
       },
     ])
     setName('')
     setAddrInput('')
+    setMacInput('')
   }
 
   function addAuto() {
     const trimmedName = name.trim()
     if (!trimmedName) {
       setFormError('请先填写设备名称')
+      return
+    }
+    const macErr = validateMac(macInput, assignments)
+    if (macErr) {
+      setFormError(macErr)
       return
     }
     const addr = firstFreeAddress(seg, assignments)
@@ -101,10 +120,18 @@ function SegmentBlock({
     }
     commit([
       ...assignments,
-      { id: hostUid(), ownerId: seg.ownerId, name: trimmedName, address: addr, mode: 'auto' },
+      {
+        id: hostUid(),
+        ownerId: seg.ownerId,
+        name: trimmedName,
+        address: addr,
+        mode: 'auto',
+        mac: normalizeMac(macInput) ?? '',
+      },
     ])
     setName('')
     setAddrInput('')
+    setMacInput('')
   }
 
   function remove(id: string) {
@@ -113,7 +140,12 @@ function SegmentBlock({
   }
 
   function startEdit(row: (typeof rows)[number]) {
-    setEditing({ id: row.assignment.id, value: intToIp(row.assignment.address), error: null })
+    setEditing({
+      id: row.assignment.id,
+      value: intToIp(row.assignment.address),
+      mac: row.assignment.mac,
+      error: null,
+    })
   }
 
   function saveEdit() {
@@ -127,11 +159,17 @@ function SegmentBlock({
       setEditing({ ...editing, error: err })
       return
     }
+    const macErr = validateMac(editing.mac, assignments, editing.id)
+    if (macErr) {
+      setEditing({ ...editing, error: macErr })
+      return
+    }
     const newAddr = ipToInt(editing.value.trim())
+    const newMac = normalizeMac(editing.mac) ?? ''
     onChange(
       assignments.map((a) =>
         a.id === editing.id
-          ? { ...a, address: newAddr, mode: newAddr === a.address ? a.mode : 'manual' }
+          ? { ...a, address: newAddr, mac: newMac, mode: newAddr === a.address ? a.mode : 'manual' }
           : a,
       ),
     )
@@ -183,6 +221,26 @@ function SegmentBlock({
                       </span>
                     )}
                   </td>
+                  <td className="mono host-mac">
+                    {isEditing ? (
+                      <input
+                        type="text"
+                        value={editing.mac}
+                        placeholder="aa:bb:cc:dd:ee:ff（可留空）"
+                        onChange={(e) =>
+                          setEditing({ ...editing, mac: e.target.value, error: null })
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') saveEdit()
+                          if (e.key === 'Escape') setEditing(null)
+                        }}
+                      />
+                    ) : row.assignment.mac ? (
+                      row.assignment.mac
+                    ) : (
+                      <span className="host-mac-empty">未录入</span>
+                    )}
+                  </td>
                   <td>
                     <span className={`host-mode ${row.assignment.mode}`}>
                       {row.assignment.mode === 'auto' ? '自动' : '手动'}
@@ -205,8 +263,8 @@ function SegmentBlock({
                       </>
                     ) : (
                       <>
-                        <button onClick={() => startEdit(row)} title="手动修改该登记的 IPv4 地址">
-                          改址
+                        <button onClick={() => startEdit(row)} title="修改该登记的 IPv4 地址与 MAC">
+                          修改
                         </button>
                         <button className="danger-btn" onClick={() => remove(row.assignment.id)}>
                           删除
@@ -246,6 +304,18 @@ function SegmentBlock({
             if (e.key === 'Enter') addManual()
           }}
         />
+        <input
+          type="text"
+          placeholder="MAC（可选），如 aa:bb:cc:dd:ee:ff 或 aa-bb-cc-dd-ee-ff"
+          value={macInput}
+          onChange={(e) => {
+            setMacInput(e.target.value)
+            setFormError(null)
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') addManual()
+          }}
+        />
         <button onClick={addAuto} disabled={full} title="取本网段第一个未占用的可用地址并登记">
           ⤓ 自动取址
         </button>
@@ -278,6 +348,13 @@ function OrphanList({
               <td className="mono host-addr">
                 <span className="host-addr-bad">{intToIp(row.assignment.address)}</span>
               </td>
+              <td className="mono host-mac">
+                {row.assignment.mac ? (
+                  row.assignment.mac
+                ) : (
+                  <span className="host-mac-empty">未录入</span>
+                )}
+              </td>
               <td>
                 <span className={`host-mode ${row.assignment.mode}`}>
                   {row.assignment.mode === 'auto' ? '自动' : '手动'}
@@ -295,6 +372,79 @@ function OrphanList({
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+/** dnsmasq 静态租约生成区：只纳入当前有效且具备合法 MAC 的登记，按 IPv4 升序输出 dhcp-host 行 */
+function DnsmasqSection({ rows }: { rows: ReturnType<typeof reconcileHosts>['rows'] }) {
+  const [copied, setCopied] = useState(false)
+  // 规划或登记任何变化都会改变 rows，租约随之实时重算
+  const leases = useMemo(() => buildDnsmasqLeases(rows), [rows])
+
+  async function handleCopy() {
+    if (leases.lines.length === 0) return
+    const ok = await copyText(leases.text)
+    if (ok) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 2000)
+    }
+  }
+
+  function handleDownload() {
+    if (leases.lines.length === 0) return
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    downloadText(`dnsmasq-static-leases-${stamp}.conf`, `${leases.text}\n`)
+  }
+
+  return (
+    <div className="host-dnsmasq">
+      <div className="header-row">
+        <h3 className="host-dnsmasq-title">dnsmasq 静态租约（{leases.lines.length} 条）</h3>
+        <div className="btn-row" style={{ marginTop: 0 }}>
+          <button
+            className="primary"
+            onClick={handleCopy}
+            disabled={leases.lines.length === 0}
+            title="复制全部 dhcp-host 行（按 IPv4 升序，每行一条）"
+          >
+            {copied ? '✓ 已复制' : '📋 复制租约'}
+          </button>
+          <button
+            onClick={handleDownload}
+            disabled={leases.lines.length === 0}
+            title="下载 dnsmasq 静态租约配置文件（.conf，时间戳命名）"
+          >
+            ⬇ 下载 .conf
+          </button>
+        </div>
+      </div>
+      <p className="subtitle" style={{ margin: '6px 0 8px' }}>
+        仅纳入<strong>当前有效且已录入合法 MAC</strong> 的登记，按 IPv4 升序生成
+        <span className="mono"> dhcp-host=&lt;MAC&gt;,&lt;IPv4&gt;</span>
+        行，可直接并入 dnsmasq 配置；失效或缺失 MAC 的登记在下方列出原因，不会出现在输出中。
+      </p>
+      {leases.lines.length > 0 ? (
+        <pre className="host-dnsmasq-out mono">{`${leases.text}\n`}</pre>
+      ) : (
+        <p className="summary-empty">暂无可生成的租约：请为有效登记录入 MAC 地址。</p>
+      )}
+      {leases.skipped.length > 0 && (
+        <div className="host-dnsmasq-skipped">
+          <div className="host-dnsmasq-skipped-title">
+            以下 {leases.skipped.length} 条登记未纳入输出：
+          </div>
+          <ul>
+            {leases.skipped.map((s) => (
+              <li key={s.id}>
+                <span className="host-dnsmasq-skip-name">{s.name || '未命名设备'}</span>
+                <span className="mono host-dnsmasq-skip-ip">{intToIp(s.address)}</span>
+                <span className="host-invalid-tag">{s.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   )
 }
@@ -341,9 +491,11 @@ export default function HostAddressPanel({ result, assignments, onAssignmentsCha
       </div>
       <p className="subtitle" style={{ marginBottom: 10 }}>
         为<strong>成功分配</strong>的固定 / 自动网段登记设备地址：可「自动取址」（本网段第一个未占用可用地址），
-        也可手动输入 IPv4。系统自动跳过网络地址与广播地址，拒绝越界、重复或已占用的地址；
+        也可手动输入 IPv4；每条登记可同时录入 MAC（冒号或连字符六组十六进制，拒绝全零 / 组播 / 重复）。
+        系统自动跳过网络地址与广播地址，拒绝越界、重复或已占用的地址；
         每个网段实时显示剩余可用数。重新规划后仍合法的登记按需求稳定 ID 保留，
         失效登记明确标记且<strong>不会被静默改址</strong>。
+        面板底部实时生成 <span className="mono">dnsmasq</span> 静态租约（dhcp-host 行），支持复制与下载。
       </p>
 
       {invalid && (
@@ -371,6 +523,7 @@ export default function HostAddressPanel({ result, assignments, onAssignmentsCha
               />
             )
           })}
+          <DnsmasqSection rows={rows} />
         </>
       )}
     </div>
