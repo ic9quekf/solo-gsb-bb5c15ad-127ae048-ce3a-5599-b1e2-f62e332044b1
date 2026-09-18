@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react'
+import DnsmasqLeases from './DnsmasqLeases'
 import { intToIp, ipToInt } from '../lib/ip'
+import { checkMac } from '../lib/mac'
 import {
   allocatableSegments,
   firstFreeAddress,
@@ -35,6 +37,13 @@ const INVALID_BADGE: Partial<Record<HostInvalidReason, string>> = {
   duplicate: '重复',
 }
 
+type EditState = {
+  id: string
+  field: 'address' | 'mac'
+  value: string
+  error: string | null
+}
+
 /** 单个网段的登记块（设备表 + 添加表单） */
 function SegmentBlock({
   seg,
@@ -53,20 +62,28 @@ function SegmentBlock({
 }) {
   const [name, setName] = useState('')
   const [addrInput, setAddrInput] = useState('')
+  const [macInput, setMacInput] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
-  const [editing, setEditing] = useState<{ id: string; value: string; error: string | null } | null>(
-    null,
-  )
+  const [editing, setEditing] = useState<EditState | null>(null)
 
   function commit(next: HostAssignment[]) {
     setFormError(null)
     onChange(next)
   }
 
-  function addManual() {
+  /** 添加前统一校验设备名与可选 MAC（MAC 留空表示不填写）；返回 [合法MAC?, 错误] */
+  function checkNameAndMac(): { mac?: string } | string {
     const trimmedName = name.trim()
-    if (!trimmedName) {
-      setFormError('请先填写设备名称')
+    if (!trimmedName) return '请先填写设备名称'
+    const macResult = checkMac(macInput, assignments)
+    if (macResult.error) return macResult.error
+    return { mac: macResult.mac }
+  }
+
+  function addManual() {
+    const nameMac = checkNameAndMac()
+    if (typeof nameMac === 'string') {
+      setFormError(nameMac)
       return
     }
     const err = validateManualAddress(addrInput, seg, assignments)
@@ -79,19 +96,21 @@ function SegmentBlock({
       {
         id: hostUid(),
         ownerId: seg.ownerId,
-        name: trimmedName,
+        name: name.trim(),
         address: ipToInt(addrInput.trim()),
         mode: 'manual',
+        ...(nameMac.mac ? { mac: nameMac.mac } : {}),
       },
     ])
     setName('')
     setAddrInput('')
+    setMacInput('')
   }
 
   function addAuto() {
-    const trimmedName = name.trim()
-    if (!trimmedName) {
-      setFormError('请先填写设备名称')
+    const nameMac = checkNameAndMac()
+    if (typeof nameMac === 'string') {
+      setFormError(nameMac)
       return
     }
     const addr = firstFreeAddress(seg, assignments)
@@ -101,10 +120,18 @@ function SegmentBlock({
     }
     commit([
       ...assignments,
-      { id: hostUid(), ownerId: seg.ownerId, name: trimmedName, address: addr, mode: 'auto' },
+      {
+        id: hostUid(),
+        ownerId: seg.ownerId,
+        name: name.trim(),
+        address: addr,
+        mode: 'auto',
+        ...(nameMac.mac ? { mac: nameMac.mac } : {}),
+      },
     ])
     setName('')
     setAddrInput('')
+    setMacInput('')
   }
 
   function remove(id: string) {
@@ -112,27 +139,47 @@ function SegmentBlock({
     commit(assignments.filter((a) => a.id !== id))
   }
 
-  function startEdit(row: (typeof rows)[number]) {
-    setEditing({ id: row.assignment.id, value: intToIp(row.assignment.address), error: null })
+  function startEditAddress(row: (typeof rows)[number]) {
+    setEditing({ id: row.assignment.id, field: 'address', value: intToIp(row.assignment.address), error: null })
+  }
+
+  function startEditMac(row: (typeof rows)[number]) {
+    setEditing({ id: row.assignment.id, field: 'mac', value: row.assignment.mac ?? '', error: null })
   }
 
   function saveEdit() {
     if (!editing) return
-    if (!assignments.some((a) => a.id === editing.id)) {
+    const target = assignments.find((a) => a.id === editing.id)
+    if (!target) {
       setEditing(null)
       return
     }
-    const err = validateManualAddress(editing.value, seg, assignments, editing.id)
-    if (err) {
-      setEditing({ ...editing, error: err })
+    if (editing.field === 'address') {
+      const err = validateManualAddress(editing.value, seg, assignments, editing.id)
+      if (err) {
+        setEditing({ ...editing, error: err })
+        return
+      }
+      const newAddr = ipToInt(editing.value.trim())
+      onChange(
+        assignments.map((a) =>
+          a.id === editing.id
+            ? { ...a, address: newAddr, mode: newAddr === a.address ? a.mode : 'manual' }
+            : a,
+        ),
+      )
+      setEditing(null)
       return
     }
-    const newAddr = ipToInt(editing.value.trim())
+    // MAC 编辑：留空保存即清除 MAC（仍可重新录入）
+    const macResult = checkMac(editing.value, assignments, editing.id)
+    if (macResult.error) {
+      setEditing({ ...editing, error: macResult.error })
+      return
+    }
     onChange(
       assignments.map((a) =>
-        a.id === editing.id
-          ? { ...a, address: newAddr, mode: newAddr === a.address ? a.mode : 'manual' }
-          : a,
+        a.id === editing.id ? { ...a, mac: macResult.mac } : a,
       ),
     )
     setEditing(null)
@@ -157,30 +204,81 @@ function SegmentBlock({
 
       {rows.length > 0 && (
         <table className="host-table">
+          <thead>
+            <tr>
+              <th className="host-device-name">设备名称</th>
+              <th className="host-addr">IPv4</th>
+              <th className="host-mac-head">MAC（可选）</th>
+              <th>方式</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
           <tbody>
             {rows.map((row) => {
-              const isEditing = editing?.id === row.assignment.id
+              const editOfThis = editing?.id === row.assignment.id ? editing : null
               return (
                 <tr key={row.assignment.id} className={row.valid ? '' : 'host-invalid-row'}>
                   <td className="host-device-name">{row.assignment.name || '未命名设备'}</td>
                   <td className="mono host-addr">
-                    {isEditing ? (
-                      <input
-                        type="text"
-                        value={editing.value}
-                        autoFocus
-                        onChange={(e) =>
-                          setEditing({ ...editing, value: e.target.value, error: null })
-                        }
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') saveEdit()
-                          if (e.key === 'Escape') setEditing(null)
-                        }}
-                      />
+                    {editOfThis?.field === 'address' ? (
+                      <>
+                        <input
+                          type="text"
+                          value={editOfThis.value}
+                          autoFocus
+                          onChange={(e) =>
+                            setEditing({ ...editOfThis, value: e.target.value, error: null })
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveEdit()
+                            if (e.key === 'Escape') setEditing(null)
+                          }}
+                        />
+                        {editOfThis.error && <div className="host-form-error">{editOfThis.error}</div>}
+                      </>
                     ) : (
                       <span className={row.valid ? '' : 'host-addr-bad'}>
                         {intToIp(row.assignment.address)}
                       </span>
+                    )}
+                  </td>
+                  <td className="mono host-mac-cell">
+                    {editOfThis?.field === 'mac' ? (
+                      <>
+                        <input
+                          type="text"
+                          className="host-mac-input"
+                          placeholder="aa:bb:cc:dd:ee:ff（留空清除）"
+                          value={editOfThis.value}
+                          autoFocus
+                          onChange={(e) =>
+                            setEditing({ ...editOfThis, value: e.target.value, error: null })
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveEdit()
+                            if (e.key === 'Escape') setEditing(null)
+                          }}
+                        />
+                        {editOfThis.error && <div className="host-form-error">{editOfThis.error}</div>}
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="host-mac-edit"
+                        title={
+                          row.assignment.mac
+                            ? '修改该设备的 MAC 地址'
+                            : '为该设备录入 MAC（冒号或连字符六组十六进制）'
+                        }
+                        onClick={() => startEditMac(row)}
+                      >
+                        {row.assignment.mac ? (
+                          row.assignment.mac
+                        ) : (
+                          <span className="host-mac-none">＋ 录入 MAC</span>
+                        )}
+                      </button>
                     )}
                   </td>
                   <td>
@@ -196,7 +294,7 @@ function SegmentBlock({
                     )}
                   </td>
                   <td className="host-actions">
-                    {isEditing ? (
+                    {editOfThis ? (
                       <>
                         <button className="primary" onClick={saveEdit}>
                           保存
@@ -205,16 +303,13 @@ function SegmentBlock({
                       </>
                     ) : (
                       <>
-                        <button onClick={() => startEdit(row)} title="手动修改该登记的 IPv4 地址">
+                        <button onClick={() => startEditAddress(row)} title="手动修改该登记的 IPv4 地址">
                           改址
                         </button>
                         <button className="danger-btn" onClick={() => remove(row.assignment.id)}>
                           删除
                         </button>
                       </>
-                    )}
-                    {isEditing && editing.error && (
-                      <div className="host-form-error">{editing.error}</div>
                     )}
                   </td>
                 </tr>
@@ -246,6 +341,19 @@ function SegmentBlock({
             if (e.key === 'Enter') addManual()
           }}
         />
+        <input
+          type="text"
+          className="host-mac-input"
+          placeholder="MAC（可选）aa:bb:cc:dd:ee:ff"
+          value={macInput}
+          onChange={(e) => {
+            setMacInput(e.target.value)
+            setFormError(null)
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') addManual()
+          }}
+        />
         <button onClick={addAuto} disabled={full} title="取本网段第一个未占用的可用地址并登记">
           ⤓ 自动取址
         </button>
@@ -271,12 +379,29 @@ function OrphanList({
     <div className="host-orphans">
       <h3>失效登记（{rows.length}）— 地址保持原样，需手动删除或调整规划</h3>
       <table className="host-table">
+        <thead>
+          <tr>
+            <th className="host-device-name">设备名称</th>
+            <th className="host-addr">IPv4</th>
+            <th className="host-mac-head">MAC</th>
+            <th>方式</th>
+            <th>原因</th>
+            <th>操作</th>
+          </tr>
+        </thead>
         <tbody>
           {rows.map((row) => (
             <tr key={row.assignment.id} className="host-invalid-row">
               <td className="host-device-name">{row.assignment.name || '未命名设备'}</td>
               <td className="mono host-addr">
                 <span className="host-addr-bad">{intToIp(row.assignment.address)}</span>
+              </td>
+              <td className="mono host-mac-cell">
+                {row.assignment.mac ? (
+                  row.assignment.mac
+                ) : (
+                  <span className="host-mac-none">—</span>
+                )}
               </td>
               <td>
                 <span className={`host-mode ${row.assignment.mode}`}>
@@ -341,13 +466,14 @@ export default function HostAddressPanel({ result, assignments, onAssignmentsCha
       </div>
       <p className="subtitle" style={{ marginBottom: 10 }}>
         为<strong>成功分配</strong>的固定 / 自动网段登记设备地址：可「自动取址」（本网段第一个未占用可用地址），
-        也可手动输入 IPv4。系统自动跳过网络地址与广播地址，拒绝越界、重复或已占用的地址；
+        也可手动输入 IPv4，并可选录入 <strong>MAC 地址</strong>（冒号或连字符六组十六进制，自动规范为小写冒号；
+        拒绝全零、组播位与跨设备重复）。系统自动跳过网络地址与广播地址，拒绝越界、重复或已占用的地址；
         每个网段实时显示剩余可用数。重新规划后仍合法的登记按需求稳定 ID 保留，
-        失效登记明确标记且<strong>不会被静默改址</strong>。
+        失效登记明确标记且<strong>不会被静默改址</strong>。面板底部按当前登记实时生成 dnsmasq 静态租约。
       </p>
 
       {invalid && (
-        <div className="summary-disabled-note">输入非法（请先修正左侧错误），主机地址分配已暂停，登记不会丢失。</div>
+        <div className="summary-disabled-note">输入非法（请先修正左侧错误），主机地址分配与 dnsmasq 租约生成已暂停，登记不会丢失。</div>
       )}
       {!invalid && segments.length === 0 && (
         <div className="summary-disabled-note">当前没有成功分配的固定或自动网段，暂无可登记的网段。</div>
@@ -371,6 +497,7 @@ export default function HostAddressPanel({ result, assignments, onAssignmentsCha
               />
             )
           })}
+          <DnsmasqLeases result={result} assignments={assignments} />
         </>
       )}
     </div>

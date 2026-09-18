@@ -5,6 +5,8 @@ import {
   reconcileHosts,
   validateManualAddress,
 } from '../src/lib/hosts'
+import { buildDnsmasqLeases, dnsmasqLeasesText } from '../src/lib/dnsmasq'
+import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
 import { intToIp, ipToInt, prefixForHosts } from '../src/lib/ip'
 import { plan } from '../src/lib/planner'
@@ -822,6 +824,117 @@ check('规划引擎签名不含主机数据（结果确定性一致）', JSON.st
 const exportJson = buildExportJson(hostPlan, { parentCidr: demo.parentCidr })
 check('导出 JSON 不含主机登记字段', !/主机地址|设备地址|host/i.test(exportJson))
 check('路由汇总结论不受登记影响', summarizeSegments(allocSegs).totalAddresses === 228)
+
+// ========== 16) MAC 录入校验与规范 ==========
+// 16a) 冒号 / 连字符六组十六进制 -> 小写冒号规范格式
+check('冒号大写 MAC 规范为小写冒号', normalizeMacInput('AA:BB:CC:DD:EE:FF').mac === 'aa:bb:cc:dd:ee:ff')
+check('连字符 MAC 规范为小写冒号', normalizeMacInput('AA-BB-CC-DD-EE-FF').mac === 'aa:bb:cc:dd:ee:ff')
+check('冒号小写 MAC 原样通过', normalizeMacInput('0a:1b:2c:3d:4e:5f').mac === '0a:1b:2c:3d:4e:5f')
+check('带首尾空白的 MAC 可通过并规范', normalizeMacInput('  aa-bb-cc-dd-ee-ff ').mac === 'aa:bb:cc:dd:ee:ff')
+// 16b) 空输入表示暂不填写
+check('空 MAC 输入视为未填写（mac=undefined、无错误）', (() => {
+  const r = normalizeMacInput('   ')
+  return r.mac === undefined && r.error === undefined
+})())
+// 16c) 拒绝非法格式：位数不对、混用分隔符、点分写法、非十六进制、组数不对
+check('拒绝单位数组', !!normalizeMacInput('a:bb:cc:dd:ee:ff').error)
+check('拒绝三组数（点分写法）', !!normalizeMacInput('aabb.ccdd.eeff').error)
+check('拒绝混用冒号与连字符', !!normalizeMacInput('aa:bb-cc:dd:ee:ff').error)
+check('拒绝非十六进制字符', !!normalizeMacInput('zz:bb:cc:dd:ee:ff').error)
+check('拒绝组数不足', !!normalizeMacInput('aa:bb:cc:dd:ee').error)
+check('拒绝组数过多', !!normalizeMacInput('aa:bb:cc:dd:ee:ff:00').error)
+// 16d) 拒绝全零
+check('拒绝全零 MAC（冒号）', /全零/.test(normalizeMacInput('00:00:00:00:00:00').error ?? ''))
+check('拒绝全零 MAC（连字符）', /全零/.test(normalizeMacInput('00-00-00-00-00-00').error ?? ''))
+// 16e) 拒绝组播位（首字节最低位为 1），含广播
+check('拒绝广播 MAC ff:ff:ff:ff:ff:ff', /组播位/.test(normalizeMacInput('ff:ff:ff:ff:ff:ff').error ?? ''))
+check('拒绝奇数首字节（01:00:00:00:00:00）', /组播位/.test(normalizeMacInput('01:00:00:00:00:00').error ?? ''))
+check('拒绝奇数首字节（03:00:00:00:00:00）', /组播位/.test(normalizeMacInput('03-00-00-00-00-00').error ?? ''))
+// 偶数首字节（含本地管理位 02）通过
+check('偶数首字节 02:.. 通过（本地管理位不是组播位）', normalizeMacInput('02:42:1a:2b:3c:4d').mac === '02:42:1a:2b:3c:4d')
+check('偶数首字节 0a:.. 通过', normalizeMacInput('0a:bb:cc:dd:ee:ff').mac === '0a:bb:cc:dd:ee:ff')
+// 16f) 跨设备重复：checkMac 全局查重（不限网段），编辑自身不算重复
+const macOwners: HostAssignment[] = [
+  { id: 'm1', ownerId: 'q4', name: '设备A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:ff' },
+]
+check('重复 MAC（大小写/分隔符归一后）被拒绝', /与设备“设备A”重复/.test(checkMac('AA-BB-CC-DD-EE-FF', macOwners).error ?? ''))
+check('不同 MAC 通过', checkMac('0a:1b:2c:3d:4e:5f', macOwners).mac === '0a:1b:2c:3d:4e:5f')
+check('编辑自身保留原 MAC 不算重复', checkMac('aa:bb:cc:dd:ee:ff', macOwners, 'm1').error === undefined)
+check('编辑自身改成未占用的 MAC 可通过', checkMac('0a:1b:2c:3d:4e:5f', macOwners, 'm1').mac === '0a:1b:2c:3d:4e:5f')
+macOwners.push({ id: 'm2', ownerId: 'q1', name: '设备B', address: ipToInt('192.168.10.129'), mode: 'auto', mac: '0a:1b:2c:3d:4e:5f' })
+check('跨网段重复 MAC 同样被拒绝（全局去重）', /与设备“设备B”重复/.test(checkMac('0a:1b:2c:3d:4e:5f', macOwners, 'm1').error ?? ''))
+
+// ========== 17) dnsmasq 静态租约生成 ==========
+// 演示规划：q4=192.168.10.16/30（.17/.18），q1=128/25，q2=64/26，q3=32/27
+const leaseList: HostAssignment[] = [
+  { id: 'l1', ownerId: 'q4', name: '管理设备2', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:ff' },
+  { id: 'l2', ownerId: 'q4', name: '管理设备1', address: ipToInt('192.168.10.17'), mode: 'auto', mac: '00:11:22:33:44:55' },
+  { id: 'l3', ownerId: 'q1', name: '办公设备', address: ipToInt('192.168.10.200'), mode: 'manual', mac: '0a:0b:0c:0d:0e:0f' },
+  { id: 'l4', ownerId: 'q1', name: '无MAC设备', address: ipToInt('192.168.10.129'), mode: 'auto' },
+]
+const dl = buildDnsmasqLeases(leaseList, hostPlan)
+check(
+  '租约输出仅含 3 条合法 MAC 登记，无 MAC 条目被排除',
+  dl.leases.length === 3 && dl.excluded.length === 1,
+  JSON.stringify({ leases: dl.leases.length, excluded: dl.excluded.length }),
+)
+check(
+  '租约按 IPv4 升序（.17, .18, .200），与录入顺序无关',
+  dl.leases.map((l) => l.ip).join(',') === '192.168.10.17,192.168.10.18,192.168.10.200',
+  dl.leases.map((l) => l.ip).join(','),
+)
+check(
+  '每行格式 dhcp-host=<MAC>,<IPv4>',
+  dnsmasqLeasesText(dl.leases) ===
+    'dhcp-host=00:11:22:33:44:55,192.168.10.17\n' +
+      'dhcp-host=aa:bb:cc:dd:ee:ff,192.168.10.18\n' +
+      'dhcp-host=0a:0b:0c:0d:0e:0f,192.168.10.200',
+  dnsmasqLeasesText(dl.leases),
+)
+check('未填写 MAC 的排除原因正确', dl.excluded[0].reason === '未填写 MAC' && dl.excluded[0].assignment.id === 'l4')
+check('空租约列表输出为空串', dnsmasqLeasesText(buildDnsmasqLeases([], hostPlan).leases) === '')
+
+// 17b) 失效登记（越界）不输出，原因列出且保留原地址
+const invalidLease: HostAssignment[] = [
+  { id: 'x1', ownerId: 'q4', name: '越界设备', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+]
+const dx = buildDnsmasqLeases(invalidLease, hostPlan)
+check('失效登记不进入租约输出', dx.leases.length === 0 && dx.excluded.length === 1)
+check('失效排除原因包含登记失效说明与原地址', /登记失效/.test(dx.excluded[0].reason) && /192\.168\.10\.40/.test(dx.excluded[0].reason), dx.excluded[0].reason)
+
+// 17c) 需求删除（owner-gone）的孤儿登记也不输出
+const goneLease = buildDnsmasqLeases(
+  [{ id: 'g1', ownerId: 'q4', name: '孤儿', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:ff' }],
+  plan({
+    parentCidr: '192.168.10.0/24',
+    reservations: [{ id: 'r1', name: '保留', cidr: '192.168.10.0/28' }],
+    requirements: demo.requirements.filter((q) => q.id !== 'q4'),
+  }),
+)
+check('孤儿登记不进入租约输出且原因非空', goneLease.leases.length === 0 && /登记失效/.test(goneLease.excluded[0].reason))
+
+// 17d) 规划变化后实时重算：迁移前输出，迁移后（地址失效）自动撤出
+check('迁移前租约可输出', buildDnsmasqLeases(
+  [{ id: 'h1', ownerId: 'q4', name: '管理设备1', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:ff' }],
+  hostPlan,
+).leases.length === 1)
+const migratedLeases = buildDnsmasqLeases(
+  [{ id: 'h1', ownerId: 'q4', name: '管理设备1', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:ff' }],
+  migratedPlan,
+)
+check('规划迁移后租约自动撤出并在排除清单给出原因', migratedLeases.leases.length === 0 && migratedLeases.excluded.length === 1)
+
+// 17e) 防御：异常重复 MAC（绕过录入校验的旧数据）只保留最早一条
+const dupMacList: HostAssignment[] = [
+  { id: 'd1', ownerId: 'q4', name: '设备1', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:ff' },
+  { id: 'd2', ownerId: 'q4', name: '设备2', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:ff' },
+]
+const dd = buildDnsmasqLeases(dupMacList, hostPlan)
+// 注：reconcileHosts 先按同 IP 查重（这里 IP 不同均有效），生成层再按 MAC 去重
+check('重复 MAC 仅最早一条输出，另一条列入排除并说明重复', dd.leases.length === 1 && dd.leases[0].assignment.id === 'd1' && /MAC .*重复/.test(dd.excluded[0].reason))
+
+// 17f) MAC 数据不进入 JSON 导出
+check('导出 JSON 不含 MAC 字段', !/dhcp-host|mac地址|MAC地址/.test(exportJson) && !/"mac"/.test(buildExportJson(hostPlan, { parentCidr: demo.parentCidr })))
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)

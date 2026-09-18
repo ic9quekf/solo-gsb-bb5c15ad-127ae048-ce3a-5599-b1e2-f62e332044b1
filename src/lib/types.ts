@@ -175,4 +175,6 @@ export interface HostAssignment {
   /** 登记地址（数值，始终保存用户最后确认的地址，失效时也不静默改写） */
   address: number
   mode: HostAssignMode
+  /** 可选 MAC（小写冒号规范格式，如 aa:bb:cc:dd:ee:ff）；缺省表示未填写，不进入 dnsmasq 输出 */
+  mac?: string
 }
